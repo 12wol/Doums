@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// 全局色号定义（MARD 221 色，可自定义名称/颜色/配图）
+model Color {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  hex       String
+  series    String
+  imageUrl  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stocks       Stock[]
+  consumptions ConsumptionItem[]
+  projectItems ProjectItem[]
+}
+
+/// 拼豆仓库
+model Warehouse {
+  id           String   @id @default(cuid())
+  name         String
+  uniqueCode   String   @unique
+  defaultQty   Int      @default(1000)
+  description  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  stocks       Stock[]
+  consumptions Consumption[]
+  projects     Project[]
+}
+
+/// 某仓库某色号的库存
+model Stock {
+  id          String   @id @default(cuid())
+  warehouseId String
+  colorId     String
+  quantity    Int      @default(0)
+  updatedAt   DateTime @updatedAt
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  color     Color     @relation(fields: [colorId], references: [id], onDelete: Cascade)
+
+  @@unique([warehouseId, colorId])
+  @@index([warehouseId])
+  @@index([colorId])
+}
+
+/// 消耗记录（一期：手动录入）
+model Consumption {
+  id          String   @id @default(cuid())
+  warehouseId String
+  note        String?
+  source      String   @default("manual")
+  createdAt   DateTime @default(now())
+
+  warehouse Warehouse         @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  items     ConsumptionItem[]
+  project   Project?
+
+  @@index([warehouseId])
+}
+
+/// 消耗明细
+model ConsumptionItem {
+  id            String @id @default(cuid())
+  consumptionId String
+  colorId       String
+  quantity      Int
+
+  consumption Consumption @relation(fields: [consumptionId], references: [id], onDelete: Cascade)
+  color       Color       @relation(fields: [colorId], references: [id], onDelete: Cascade)
+
+  @@index([consumptionId])
+}
+
+/// 拼豆项目：想拼 → 正在拼 → 拼完了
+model Project {
+  id             String        @id @default(cuid())
+  title          String
+  imageUrl       String?
+  status         String        @default("WISH")
+  warehouseId    String?
+  consumptionId  String?       @unique
+  note           String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  warehouse   Warehouse?    @relation(fields: [warehouseId], references: [id], onDelete: SetNull)
+  consumption Consumption?  @relation(fields: [consumptionId], references: [id], onDelete: SetNull)
+  items       ProjectItem[]
+
+  @@index([status])
+  @@index([warehouseId])
+}
+
+/// 图纸所需豆子
+model ProjectItem {
+  id        String @id @default(cuid())
+  projectId String
+  colorId   String
+  quantity  Int
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  color   Color   @relation(fields: [colorId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, colorId])
+  @@index([projectId])
+}
