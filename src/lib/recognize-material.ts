@@ -1,5 +1,4 @@
-import { parseMaterialListFromOcrText, parseMaterialLine } from "./ocr-text";
-import { fixColorCode, normalizeOcrBlob } from "./ocr-text";
+import { parseMaterialListFromOcrText, parseMaterialLine, fixColorCode, normalizeOcrBlob } from "./ocr-text";
 
 export type BBox = { x0: number; y0: number; x1: number; y1: number };
 
@@ -14,21 +13,24 @@ export type OcrLine = {
   tokens: OcrToken[];
 };
 
-export type LayoutDirection = "left" | "right" | "above" | "below";
+/** 数量只在色号右侧或下方 */
+export type LayoutDirection = "right" | "below";
 
 export type RecognizedPair = {
   code: string;
   quantity: number;
   layout: LayoutDirection;
   confidence: number;
-  method: "line-text" | "line-adjacent" | "line-below" | "cell";
+  method: "line-seq" | "line-text" | "line-below" | "cell";
 };
 
 const MIN_QTY = 1;
 const MAX_QTY = 50000;
+const LETTER_ONLY = /^[A-HM]$/i;
+const DIGITS_ONLY = /^\d{1,5}$/;
 
 const METHOD_PRIORITY: Record<RecognizedPair["method"], number> = {
-  "line-adjacent": 5,
+  "line-seq": 5,
   "line-text": 4,
   "line-below": 3,
   cell: 2,
@@ -40,25 +42,6 @@ function center(b: BBox) {
 
 function size(b: BBox) {
   return { w: b.x1 - b.x0, h: b.y1 - b.y0 };
-}
-
-function yOverlap(a: BBox, b: BBox): number {
-  const top = Math.max(a.y0, b.y0);
-  const bottom = Math.min(a.y1, b.y1);
-  const overlap = Math.max(0, bottom - top);
-  const minH = Math.min(size(a).h, size(b).h) || 1;
-  return overlap / minH;
-}
-
-export function detectLayout(codeBox: BBox, qtyBox: BBox): LayoutDirection {
-  const cc = center(codeBox);
-  const qc = center(qtyBox);
-  const dx = qc.cx - cc.cx;
-  const dy = qc.cy - cc.cy;
-  if (Math.abs(dx) > Math.abs(dy)) {
-    return dx > 0 ? "right" : "left";
-  }
-  return dy > 0 ? "below" : "above";
 }
 
 function parseQuantity(text: string): number | null {
@@ -84,6 +67,44 @@ function computeMetrics(tokens: OcrToken[]): Metrics {
     medianH: hs[mid] || 16,
     medianW: ws[mid] || 24,
   };
+}
+
+/** 合并被拆开的色号：F + 11 → F11 */
+function mergeSplitCodeTokens(tokens: OcrToken[], medianW: number): OcrToken[] {
+  const sorted = [...tokens].sort(
+    (a, b) => center(a.bbox).cy - center(b.bbox).cy || center(a.bbox).cx - center(b.bbox).cx
+  );
+  const out: OcrToken[] = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const next = sorted[i + 1];
+    const letter = LETTER_ONLY.test(cur.text.trim());
+    const digits = next && DIGITS_ONLY.test(next.text.trim()) && next.text.trim().length <= 3;
+
+    // F + 11 → F11（单字母 + ≤2 位数字）
+    if (letter && digits && next!.text.trim().length <= 2) {
+      const sameRow = Math.abs(center(cur.bbox).cy - center(next.bbox).cy) <= medianW * 0.8;
+      const closeX = center(next.bbox).cx > center(cur.bbox).cx && center(next.bbox).cx - center(cur.bbox).cx <= medianW * 4;
+      const merged = fixColorCode(cur.text + next.text);
+      if (sameRow && closeX && merged) {
+        out.push({
+          text: merged,
+          bbox: {
+            x0: Math.min(cur.bbox.x0, next.bbox.x0),
+            y0: Math.min(cur.bbox.y0, next.bbox.y0),
+            x1: Math.max(cur.bbox.x1, next.bbox.x1),
+            y1: Math.max(cur.bbox.y1, next.bbox.y1),
+          },
+        });
+        i++;
+        continue;
+      }
+    }
+    out.push(cur);
+  }
+
+  return out;
 }
 
 /** 将词级 token 按 Y 坐标合并为行 */
@@ -128,25 +149,18 @@ function qtyKeyFromBBox(b: BBox): string {
   return `${Math.round(c.cx)}:${Math.round(c.cy)}`;
 }
 
-function xAlignScore(a: BBox, b: BBox, medianW: number): number {
-  return 1 - Math.min(1, Math.abs(center(a).cx - center(b).cx) / (medianW * 3));
-}
-
 function addCandidate(
   pool: Candidate[],
-  pair: Omit<Candidate, "qtyKey"> & { qtyBBox?: BBox },
-  qtyBBox?: BBox
+  pair: Omit<Candidate, "qtyKey">,
+  qtyBBox: BBox
 ) {
-  const box = qtyBBox ?? pair.qtyBBox;
-  if (!box) return;
   pool.push({
     ...pair,
-    qtyKey: qtyKeyFromBBox(box),
+    qtyKey: qtyKeyFromBBox(qtyBBox),
   });
 }
 
 function pickBestPairs(candidates: Candidate[]): RecognizedPair[] {
-  // 按方法优先级 + 置信度排序，贪心一对一（色号、数量均不可复用）
   const sorted = [...candidates].sort((a, b) => {
     const pr = METHOD_PRIORITY[b.method] - METHOD_PRIORITY[a.method];
     if (pr !== 0) return pr;
@@ -173,85 +187,76 @@ function pickBestPairs(candidates: Candidate[]): RecognizedPair[] {
   return picked;
 }
 
+/**
+ * 同行从左到右顺序配对：色号 → 右侧第一个未占用数字。
+ * 禁止把左侧数字当成该色号的数量。
+ */
+function pairSequentialInLine(line: OcrLine): Candidate[] {
+  const candidates: Candidate[] = [];
+  const toks = line.tokens;
+  const usedQty = new Set<number>();
+
+  for (let i = 0; i < toks.length; i++) {
+    const code = tokenAsCode(toks[i].text);
+    if (!code) continue;
+
+    let qtyIdx = -1;
+    for (let j = i + 1; j < toks.length; j++) {
+      if (usedQty.has(j)) continue;
+      // 右侧又遇到色号 → 本色号没有同行数量
+      if (tokenAsCode(toks[j].text)) break;
+      const qty = parseQuantity(toks[j].text);
+      if (qty !== null) {
+        // 必须在色号右侧
+        if (center(toks[j].bbox).cx <= center(toks[i].bbox).cx) continue;
+        qtyIdx = j;
+        break;
+      }
+    }
+
+    if (qtyIdx < 0) continue;
+    const qty = parseQuantity(toks[qtyIdx].text);
+    if (qty === null) continue;
+
+    usedQty.add(qtyIdx);
+    addCandidate(
+      candidates,
+      {
+        code,
+        quantity: qty,
+        layout: "right",
+        confidence: 0.93,
+        method: "line-seq",
+      },
+      toks[qtyIdx].bbox
+    );
+  }
+
+  return candidates;
+}
+
 function pairFromLines(lines: OcrLine[], metrics: Metrics): Candidate[] {
   const candidates: Candidate[] = [];
   const { medianH, medianW } = metrics;
 
   for (const line of lines) {
-    // 1. 整行文本解析（同一行内）
+    // 1. 坐标顺序配对（主路径）
+    candidates.push(...pairSequentialInLine(line));
+
+    // 2. 行文本解析补充（同样只认色号在前）
     for (const p of parseMaterialLine(line.text)) {
       candidates.push({
         code: p.code,
         quantity: p.quantity,
         layout: "right",
-        confidence: 0.82,
+        confidence: 0.8,
         method: "line-text",
-        qtyKey: `${p.code}:line-text`,
+        qtyKey: `${p.code}:line-text:${p.quantity}`,
       });
-    }
-
-    // 2. 行内相邻 token
-    const toks = line.tokens;
-    for (let i = 0; i < toks.length - 1; i++) {
-      const codeL = tokenAsCode(toks[i].text);
-      const qtyR = parseQuantity(toks[i + 1].text);
-      if (codeL && qtyR !== null) {
-        addCandidate(candidates, {
-          code: codeL,
-          quantity: qtyR,
-          layout: detectLayout(toks[i].bbox, toks[i + 1].bbox),
-          confidence: 0.92,
-          method: "line-adjacent",
-        }, toks[i + 1].bbox);
-        i++;
-        continue;
-      }
-      const qtyL = parseQuantity(toks[i].text);
-      const codeR = tokenAsCode(toks[i + 1].text);
-      if (qtyL !== null && codeR) {
-        addCandidate(candidates, {
-          code: codeR,
-          quantity: qtyL,
-          layout: detectLayout(toks[i].bbox, toks[i + 1].bbox),
-          confidence: 0.92,
-          method: "line-adjacent",
-        }, toks[i].bbox);
-        i++;
-      }
-    }
-
-    // 3. 行内非相邻但同一行：色号与最近数量（限制水平距离）
-    const codeToks = toks
-      .map((t) => ({ token: t, code: tokenAsCode(t.text) }))
-      .filter((x): x is { token: OcrToken; code: string } => !!x.code);
-    const numToks = toks
-      .map((t) => ({ token: t, qty: parseQuantity(t.text) }))
-      .filter((x): x is { token: OcrToken; qty: number } => x.qty !== null);
-
-    for (const ct of codeToks) {
-      let best: { token: OcrToken; qty: number; score: number } | null = null;
-      for (const nt of numToks) {
-        if (yOverlap(ct.token.bbox, nt.token.bbox) < 0.35) continue;
-        const dx = Math.abs(center(ct.token.bbox).cx - center(nt.token.bbox).cx);
-        if (dx > medianW * 8) continue;
-        const score = xAlignScore(ct.token.bbox, nt.token.bbox, medianW) * 0.5 + yOverlap(ct.token.bbox, nt.token.bbox) * 0.5;
-        if (!best || score > best.score) {
-          best = { token: nt.token, qty: nt.qty, score };
-        }
-      }
-      if (best && best.score > 0.4) {
-        addCandidate(candidates, {
-          code: ct.code,
-          quantity: best.qty,
-          layout: detectLayout(ct.token.bbox, best.token.bbox),
-          confidence: 0.75 + best.score * 0.15,
-          method: "line-adjacent",
-        }, best.token.bbox);
-      }
     }
   }
 
-  // 4. 上下行：色号在上、数量在下，列对齐
+  // 3. 上下布局：色号在上、数量在下，列对齐（禁止上方数量）
   for (let i = 0; i < lines.length - 1; i++) {
     const upper = lines[i].tokens
       .map((t) => ({ token: t, code: tokenAsCode(t.text) }))
@@ -265,20 +270,25 @@ function pairFromLines(lines: OcrLine[], metrics: Metrics): Candidate[] {
       for (const l of lower) {
         const dy = center(l.token.bbox).cy - center(u.token.bbox).cy;
         if (dy < medianH * 0.3 || dy > medianH * 2.5) continue;
-        const align = xAlignScore(u.token.bbox, l.token.bbox, medianW);
-        if (align < 0.55) continue;
-        if (!best || align > best.score) {
-          best = { token: l.token, qty: l.qty, score: align };
+        const dx = Math.abs(center(u.token.bbox).cx - center(l.token.bbox).cx);
+        if (dx > medianW * 2.5) continue;
+        const score = 1 - Math.min(1, dx / (medianW * 2.5));
+        if (!best || score > best.score) {
+          best = { token: l.token, qty: l.qty, score };
         }
       }
-      if (best) {
-        addCandidate(candidates, {
-          code: u.code,
-          quantity: best.qty,
-          layout: "below",
-          confidence: 0.7 + best.score * 0.2,
-          method: "line-below",
-        }, best.token.bbox);
+      if (best && best.score >= 0.45) {
+        addCandidate(
+          candidates,
+          {
+            code: u.code,
+            quantity: best.qty,
+            layout: "below",
+            confidence: 0.72 + best.score * 0.2,
+            method: "line-below",
+          },
+          best.token.bbox
+        );
       }
     }
   }
@@ -286,35 +296,46 @@ function pairFromLines(lines: OcrLine[], metrics: Metrics): Candidate[] {
   return candidates;
 }
 
-/** 格内配对：极小范围内 1 色号 + 1 数量 */
+/** 格内配对：仅接受右侧或下方的数量 */
 function pairCells(tokens: OcrToken[], metrics: Metrics): Candidate[] {
   const candidates: Candidate[] = [];
   const { medianH } = metrics;
   const cellRadius = medianH * 2.2;
 
   const codes = tokens
-    .map((t, i) => ({ i, token: t, code: tokenAsCode(t.text) }))
-    .filter((x): x is { i: number; token: OcrToken; code: string } => !!x.code);
+    .map((t) => ({ token: t, code: tokenAsCode(t.text) }))
+    .filter((x): x is { token: OcrToken; code: string } => !!x.code);
   const nums = tokens
-    .map((t, i) => ({ i, token: t, qty: parseQuantity(t.text) }))
-    .filter((x): x is { i: number; token: OcrToken; qty: number } => x.qty !== null);
+    .map((t) => ({ token: t, qty: parseQuantity(t.text) }))
+    .filter((x): x is { token: OcrToken; qty: number } => x.qty !== null);
 
   for (const c of codes) {
     const cc = center(c.token.bbox);
     const neighbors = nums.filter((n) => {
       const nc = center(n.token.bbox);
-      return Math.hypot(cc.cx - nc.cx, cc.cy - nc.cy) <= cellRadius;
+      const dist = Math.hypot(cc.cx - nc.cx, cc.cy - nc.cy);
+      if (dist > cellRadius) return false;
+      // 仅右或下
+      const right = nc.cx > cc.cx && Math.abs(nc.cy - cc.cy) <= medianH * 0.9;
+      const below = nc.cy > cc.cy && Math.abs(nc.cx - cc.cx) <= medianH * 1.2;
+      return right || below;
     });
     if (neighbors.length !== 1) continue;
 
     const n = neighbors[0];
-    addCandidate(candidates, {
-      code: c.code,
-      quantity: n.qty,
-      layout: detectLayout(c.token.bbox, n.token.bbox),
-      confidence: 0.88,
-      method: "cell",
-    }, n.token.bbox);
+    const nc = center(n.token.bbox);
+    const layout: LayoutDirection = nc.cy > cc.cy + medianH * 0.35 ? "below" : "right";
+    addCandidate(
+      candidates,
+      {
+        code: c.code,
+        quantity: n.qty,
+        layout,
+        confidence: 0.86,
+        method: "cell",
+      },
+      n.token.bbox
+    );
   }
 
   return candidates;
@@ -339,14 +360,15 @@ export function recognizeFromTokens(
     .filter((t) => t.text.length > 0);
 
   const metrics = computeMetrics(cleaned);
-  const lines = groupTokensIntoLines(cleaned);
+  const merged = mergeSplitCodeTokens(cleaned, metrics.medianW);
+  const lines = groupTokensIntoLines(merged);
 
   const candidates: Candidate[] = [
     ...pairFromLines(lines, metrics),
-    ...pairCells(cleaned, metrics),
+    ...pairCells(merged, metrics),
   ];
 
-  // 全文仅按行解析补充（不跨行），且只补充尚未出现的色号
+  // 全文按行补充尚未出现的色号（仍只认色号在前）
   const lineText = fullText?.trim() || lines.map((l) => l.text).join("\n");
   const fromText = parseMaterialListFromOcrText(lineText);
   const existingCodes = new Set(candidates.map((c) => c.code));

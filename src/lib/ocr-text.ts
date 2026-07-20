@@ -1,6 +1,12 @@
 /** OCR 常见误识别修正 + 材料清单文本解析（单行/粘贴文本） */
 
-const CODE_STRICT = /^[A-HM-Z]{1,2}\d{1,3}$/i;
+import { MARD_COLORS } from "@/data/mard-colors";
+
+/** MARD：单字母 A–H / M + 1~2 位数字 */
+const CODE_STRICT = /^[A-HM]\d{1,2}$/i;
+const LETTER_ONLY = /^[A-HM]$/i;
+const DIGITS_ONLY = /^\d{1,5}$/;
+const KNOWN_CODES = new Set(MARD_COLORS.map((c) => c.code.toUpperCase()));
 
 /** 全角、常见 OCR 混淆归一化 */
 export function normalizeOcrBlob(text: string): string {
@@ -20,61 +26,105 @@ export function fixColorCode(raw: string): string | null {
   const t = raw.toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (!t) return null;
 
-  const m = t.match(/^([A-HM-Z]{1,2})([0-9Il|O]+)$/);
-  if (!m) return CODE_STRICT.test(t) ? t : null;
+  const m = t.match(/^([A-HM])([0-9Il|O]{1,2})$/);
+  if (!m) return null;
 
   const series = m[1];
-  const num = m[2]
-    .replace(/[Il|]/g, "1")
-    .replace(/[Oo]/g, "0")
-    .replace(/^0+/, "") || "0";
+  const num =
+    m[2]
+      .replace(/[Il|]/g, "1")
+      .replace(/[Oo]/g, "0")
+      .replace(/^0+(\d)/, "$1") || "0";
 
+  // 避免 A0 这类无效号：数字部分全 0 且不在色库则丢弃
   const code = `${series}${num}`;
-  return CODE_STRICT.test(code) ? code : null;
+  if (!CODE_STRICT.test(code)) return null;
+  if (KNOWN_CODES.size > 0 && !KNOWN_CODES.has(code)) return null;
+  return code;
 }
 
-/** 解析单行文本中的 色号+数量（禁止跨行） */
-export function parseMaterialLine(line: string): { code: string; quantity: number }[] {
+/**
+ * 将一行拆成 token，并合并被 OCR 拆开的色号（如 F + 11 → F11）。
+ * 规则：数量只跟在色号后面，禁止「数量在前」。
+ */
+export function tokenizeMaterialLine(line: string): string[] {
   const normalized = normalizeOcrBlob(line);
   if (!normalized) return [];
 
-  const result = new Map<string, number>();
+  // 单字母色号 / 纯数字；杂讯字母串不会整段吞掉
+  const raw = normalized.match(/[A-HM]\d{0,2}|\d{1,5}/gi) ?? [];
+  const out: string[] = [];
 
-  const setPair = (code: string, qty: number) => {
-    if (qty >= 1 && qty <= 50000) result.set(code, qty);
-  };
+  for (let i = 0; i < raw.length; i++) {
+    const cur = raw[i];
+    const next = raw[i + 1];
 
-  // 色号在前
-  const codeFirst = /([A-HM-Z]{1,2}\s*[0-9Il|O]{1,3})\s*[x×:：\-]?\s*(\d{1,5})/gi;
-  for (const m of normalized.matchAll(codeFirst)) {
-    const code = fixColorCode(m[1]);
-    if (code) setPair(code, parseInt(m[2], 10));
-  }
-
-  // 数量在前
-  const qtyFirst = /(\d{1,5})\s*[x×:\-]?\s*([A-HM-Z]{1,2}\s*[0-9Il|O]{1,3})/gi;
-  for (const m of normalized.matchAll(qtyFirst)) {
-    const code = fixColorCode(m[2]);
-    if (code) setPair(code, parseInt(m[1], 10));
-  }
-
-  // 相邻 token：A1 320 / 320 A1
-  const tokens = normalized.match(/[A-HM-Z]{1,2}[0-9Il|O]{1,3}|\d{1,5}/gi) ?? [];
-  for (let i = 0; i < tokens.length - 1; i++) {
-    const a = fixColorCode(tokens[i]);
-    const b = fixColorCode(tokens[i + 1]);
-    const nA = /^\d+$/.test(tokens[i]) ? parseInt(tokens[i], 10) : null;
-    const nB = /^\d+$/.test(tokens[i + 1]) ? parseInt(tokens[i + 1], 10) : null;
-    if (a && nB !== null && !result.has(a)) {
-      setPair(a, nB);
-      i++;
-    } else if (nA !== null && b && !result.has(b)) {
-      setPair(b, nA);
-      i++;
+    // F + 11 → F11（仅单字母 + 1~2 位数字，且必须在色库中）
+    if (
+      next &&
+      LETTER_ONLY.test(cur) &&
+      DIGITS_ONLY.test(next) &&
+      next.length <= 2
+    ) {
+      const merged = fixColorCode(cur + next);
+      if (merged) {
+        out.push(merged);
+        i++;
+        continue;
+      }
     }
+
+    const asCode = fixColorCode(cur);
+    if (asCode) {
+      out.push(asCode);
+      continue;
+    }
+
+    if (DIGITS_ONLY.test(cur)) {
+      out.push(cur);
+      continue;
+    }
+
+    // 单独字母且无法合并 → 丢弃
   }
 
-  return Array.from(result.entries()).map(([code, quantity]) => ({ code, quantity }));
+  return out;
+}
+
+/**
+ * 从左到右顺序配对：色号 → 其后第一个纯数字为数量。
+ * 不支持「数量在色号前面」。
+ */
+export function parseMaterialLine(line: string): { code: string; quantity: number }[] {
+  const tokens = tokenizeMaterialLine(line);
+  const result: { code: string; quantity: number }[] = [];
+  const used = new Set<number>();
+
+  for (let i = 0; i < tokens.length; i++) {
+    if (used.has(i)) continue;
+    const code = fixColorCode(tokens[i]);
+    if (!code) continue;
+
+    let qtyIdx = -1;
+    for (let j = i + 1; j < tokens.length; j++) {
+      if (used.has(j)) continue;
+      if (fixColorCode(tokens[j])) break;
+      if (DIGITS_ONLY.test(tokens[j])) {
+        qtyIdx = j;
+        break;
+      }
+    }
+
+    if (qtyIdx < 0) continue;
+    const qty = parseInt(tokens[qtyIdx], 10);
+    if (qty < 1 || qty > 50000) continue;
+
+    used.add(i);
+    used.add(qtyIdx);
+    result.push({ code, quantity: qty });
+  }
+
+  return result;
 }
 
 /** 粘贴的多行清单（每行独立解析，不跨行全局扫描） */

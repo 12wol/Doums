@@ -63,15 +63,13 @@ type RecognizedItem = {
 type DraftLine = { colorId: string; code: string; hex: string; quantity: number };
 
 const LAYOUT_LABEL: Record<string, string> = {
-  left: "左",
   right: "右",
-  above: "上",
   below: "下",
 };
 
 const METHOD_LABEL: Record<string, string> = {
   cell: "格内",
-  "line-adjacent": "同行",
+  "line-seq": "顺序",
   "line-text": "行文本",
   "line-below": "下方",
 };
@@ -210,7 +208,9 @@ export function ImageRecognizer({
         {progress && <span className="text-sm opacity-60">{progress}</span>}
       </div>
       {!cropRect && (
-        <p className="mt-2 text-xs text-amber-700">请先框选并确认材料清单区域，再开始识别。</p>
+        <p className="mt-2 text-xs text-amber-700">
+          请先点击缩略图全屏框选材料清单，保存选区后再识别。
+        </p>
       )}
 
       {error && <p className="mt-2 text-sm text-red-600">{error}</p>}

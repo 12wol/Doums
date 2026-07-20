@@ -16,13 +16,18 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-/** 按原图比例裁剪，返回 PNG data URL */
+/** 按原图比例裁剪，带少量边距避免边框文字被切掉 */
 export async function cropImageByRect(imageUrl: string, rect: CropRect): Promise<string> {
   const img = await loadImage(imageUrl);
-  const sx = Math.max(0, Math.floor(rect.x * img.width));
-  const sy = Math.max(0, Math.floor(rect.y * img.height));
-  const sw = Math.min(img.width - sx, Math.floor(rect.w * img.width));
-  const sh = Math.min(img.height - sy, Math.floor(rect.h * img.height));
+  const padX = Math.max(6, Math.round(img.width * 0.006));
+  const padY = Math.max(6, Math.round(img.height * 0.006));
+
+  const sx = Math.max(0, Math.floor(rect.x * img.width) - padX);
+  const sy = Math.max(0, Math.floor(rect.y * img.height) - padY);
+  const ex = Math.min(img.width, Math.ceil((rect.x + rect.w) * img.width) + padX);
+  const ey = Math.min(img.height, Math.ceil((rect.y + rect.h) * img.height) + padY);
+  const sw = ex - sx;
+  const sh = ey - sy;
 
   if (sw < 10 || sh < 10) {
     throw new Error("选区太小，请重新框选");
