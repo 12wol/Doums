@@ -12,6 +12,7 @@ const links = [
   { href: "/building", label: "正在拼" },
   { href: "/completed", label: "拼完了" },
   { href: "/consume", label: "拼豆" },
+  { href: "/restock", label: "补豆" },
   { href: "/colors", label: "色号" },
 ];
 

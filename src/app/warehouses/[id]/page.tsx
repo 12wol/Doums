@@ -3,9 +3,10 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { Button } from "@/components/ui/Button";
+import { Button, ButtonLink } from "@/components/ui/Button";
 import { ColorSwatch, PageHeader } from "@/components/ui/Cards";
 import { SeriesFilter } from "@/components/colors/SeriesFilter";
+import { RankingModal } from "@/components/ui/RankingModal";
 import { formatNumber, cn } from "@/lib/utils";
 
 type StockItem = {
@@ -36,8 +37,11 @@ export default function WarehouseDetailPage() {
   const [loading, setLoading] = useState(true);
   const [series, setSeries] = useState<string>("");
   const [search, setSearch] = useState("");
+  const [minQty, setMinQty] = useState("");
+  const [maxQty, setMaxQty] = useState("");
   const [editing, setEditing] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
+  const [showRank, setShowRank] = useState(false);
 
   const load = useCallback(() => {
     fetch(`/api/warehouses/${id}`)
@@ -60,13 +64,31 @@ export default function WarehouseDetailPage() {
     if (series && s.color.series !== series) return false;
     if (search) {
       const q = search.toLowerCase();
-      return (
-        s.color.code.toLowerCase().includes(q) ||
-        s.color.name.toLowerCase().includes(q)
-      );
+      if (
+        !s.color.code.toLowerCase().includes(q) &&
+        !s.color.name.toLowerCase().includes(q)
+      ) {
+        return false;
+      }
     }
+    const qty = editing[s.color.id] ?? s.quantity;
+    if (minQty !== "" && !Number.isNaN(Number(minQty)) && qty < Number(minQty)) return false;
+    if (maxQty !== "" && !Number.isNaN(Number(maxQty)) && qty > Number(maxQty)) return false;
     return true;
   });
+
+  const remainingRank = useMemo(() => {
+    if (!warehouse) return [];
+    return [...warehouse.stocks]
+      .sort((a, b) => a.quantity - b.quantity || a.color.code.localeCompare(b.color.code))
+      .map((s) => ({
+        code: s.color.code,
+        hex: s.color.hex,
+        name: s.color.name,
+        value: s.quantity,
+        hint: s.color.series ? `${s.color.series} 系` : undefined,
+      }));
+  }, [warehouse]);
 
   const handleSave = async () => {
     const items = Object.entries(editing).map(([colorId, quantity]) => ({
@@ -98,10 +120,12 @@ export default function WarehouseDetailPage() {
         title={warehouse.name}
         description={`共 ${formatNumber(totalQty)} 粒 · ${warehouse.stocks.length} 色号`}
         action={
-          <div className="flex gap-2">
-            <Link href="/consume">
-              <Button>拼豆</Button>
-            </Link>
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" variant="secondary" onClick={() => setShowRank(true)}>
+              剩余排行榜
+            </Button>
+            <ButtonLink href="/restock">补豆</ButtonLink>
+            <ButtonLink href="/consume">拼豆</ButtonLink>
             {hasEdits && (
               <Button variant="secondary" onClick={handleSave} disabled={saving}>
                 {saving ? "保存中…" : "保存修改"}
@@ -111,7 +135,7 @@ export default function WarehouseDetailPage() {
         }
       />
 
-      <div className="mb-6 flex flex-col gap-3 sm:flex-row">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row">
         <input
           className="flex-1 rounded-md border border-hairline px-3 py-2.5"
           placeholder="搜索色号…"
@@ -119,6 +143,43 @@ export default function WarehouseDetailPage() {
           onChange={(e) => setSearch(e.target.value)}
         />
         <SeriesFilter series={series} options={seriesOptions} onChange={setSeries} />
+      </div>
+
+      <div className="mb-6 flex flex-wrap items-center gap-2">
+        <span className="text-sm opacity-55">数量范围</span>
+        <input
+          type="number"
+          min={0}
+          className="w-24 rounded-md border border-hairline px-2 py-2 text-sm"
+          placeholder="最低"
+          value={minQty}
+          onChange={(e) => setMinQty(e.target.value)}
+        />
+        <span className="opacity-40">–</span>
+        <input
+          type="number"
+          min={0}
+          className="w-24 rounded-md border border-hairline px-2 py-2 text-sm"
+          placeholder="最高"
+          value={maxQty}
+          onChange={(e) => setMaxQty(e.target.value)}
+        />
+        <span className="text-xs opacity-45">例：最高填 499 可筛低于 500 的色号</span>
+        {(minQty !== "" || maxQty !== "") && (
+          <button
+            type="button"
+            className="text-sm underline opacity-50 hover:opacity-100"
+            onClick={() => {
+              setMinQty("");
+              setMaxQty("");
+            }}
+          >
+            清除
+          </button>
+        )}
+        {filtered && (
+          <span className="ml-auto text-sm opacity-50">显示 {filtered.length} 色</span>
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
@@ -131,7 +192,11 @@ export default function WarehouseDetailPage() {
               key={st.id}
               className={cn(
                 "flex items-center gap-3 rounded-md border p-3",
-                isEmpty ? "border-red-300 bg-red-50" : isLow ? "border-amber-300 bg-amber-50" : "border-hairline"
+                isEmpty
+                  ? "border-red-300 bg-red-50"
+                  : isLow
+                    ? "border-amber-300 bg-amber-50"
+                    : "border-hairline"
               )}
             >
               <ColorSwatch hex={st.color.hex} code={st.color.code} />
@@ -159,6 +224,22 @@ export default function WarehouseDetailPage() {
           );
         })}
       </div>
+
+      {filtered?.length === 0 && (
+        <p className="mt-8 text-center text-sm opacity-50">没有符合筛选条件的色号</p>
+      )}
+
+      {showRank && (
+        <RankingModal
+          title="剩余排行榜"
+          subtitle={`${warehouse.name} · 从少到多`}
+          items={remainingRank}
+          valueLabel="粒"
+          variant="bars"
+          stockThresholds
+          onClose={() => setShowRank(false)}
+        />
+      )}
     </div>
   );
 }

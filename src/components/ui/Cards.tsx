@@ -30,11 +30,13 @@ export function StatCard({
   value,
   hint,
   block = "lime",
+  className,
 }: {
   label: string;
   value: string | number;
   hint?: string;
   block?: "lime" | "lilac" | "mint" | "cream" | "pink" | "coral";
+  className?: string;
 }) {
   const blocks: Record<string, string> = {
     lime: "bg-block-lime",
@@ -45,10 +47,10 @@ export function StatCard({
     coral: "bg-block-coral",
   };
   return (
-    <div className={cn("color-block", blocks[block])}>
+    <div className={cn("color-block flex h-full min-h-[8.5rem] flex-col", blocks[block], className)}>
       <p className="eyebrow mb-2 opacity-70">{label}</p>
       <p className="text-3xl font-semibold tracking-tight md:text-4xl">{value}</p>
-      {hint && <p className="mt-2 text-sm opacity-70">{hint}</p>}
+      {hint && <p className="mt-auto pt-2 text-sm opacity-70">{hint}</p>}
     </div>
   );
 }

@@ -20,6 +20,7 @@ model Color {
 
   stocks       Stock[]
   consumptions ConsumptionItem[]
+  restocks     RestockItem[]
   projectItems ProjectItem[]
 }
 
@@ -35,6 +36,7 @@ model Warehouse {
 
   stocks       Stock[]
   consumptions Consumption[]
+  restocks     Restock[]
   projects     Project[]
 }
 
@@ -80,6 +82,32 @@ model ConsumptionItem {
   color       Color       @relation(fields: [colorId], references: [id], onDelete: Cascade)
 
   @@index([consumptionId])
+}
+
+/// 补豆入库记录
+model Restock {
+  id          String   @id @default(cuid())
+  warehouseId String
+  note        String?
+  createdAt   DateTime @default(now())
+
+  warehouse Warehouse     @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  items     RestockItem[]
+
+  @@index([warehouseId])
+}
+
+/// 补豆明细
+model RestockItem {
+  id        String @id @default(cuid())
+  restockId String
+  colorId   String
+  quantity  Int
+
+  restock Restock @relation(fields: [restockId], references: [id], onDelete: Cascade)
+  color   Color   @relation(fields: [colorId], references: [id], onDelete: Cascade)
+
+  @@index([restockId])
 }
 
 /// 拼豆项目：想拼 → 正在拼 → 拼完了

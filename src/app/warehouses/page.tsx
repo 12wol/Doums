@@ -72,6 +72,7 @@ export default function WarehousesPage() {
         description="创建多个拼豆仓库，每个仓库拥有唯一识别码，初始化 221 色 MARD 标准库存。"
         action={
           <div className="flex flex-wrap gap-2">
+            <ButtonLink href="/restock">补豆</ButtonLink>
             <ButtonLink href="/consume">拼豆</ButtonLink>
             <ButtonLink href="/colors">色号</ButtonLink>
             <Button variant={showForm ? "secondary" : "primary"} onClick={() => setShowForm(!showForm)}>
